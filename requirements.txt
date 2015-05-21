@@ -1,0 +1,11 @@
+requirements.txt
+
+:Author: vagrant
+:Email: vagrant@vagrant-ubuntu-trusty-64
+:Date: 2015-05-17 19:11
+
+django-picklefield
+
+
+.. vim: expandtab filetype=rst shiftwidth=4 tabstop=4
+

@@ -1,0 +1,209 @@
+from django.db import models
+from fabric.api import run, sudo, cd, put, get
+from fabric.contrib.files import exists
+from cStringIO import StringIO
+import machine.models
+import machine
+import tempfile
+import os
+import signal as task_signal
+from django.dispatch import receiver
+
+###
+#  script : build ~> run
+###
+
+
+# Create your models here.
+class TaskGroup(models.Model):
+    docker_image = models.CharField(max_length=1024)
+    name = models.CharField(max_length=1024)
+    settings = models.TextField()
+    script = models.TextField()
+    machine_filter = models.CharField(default='.*', max_length=1024)
+    output_path = models.CharField(max_length=1024)
+
+
+class Task(models.Model):
+    name = models.CharField(max_length=1024)
+    git_ssh = models.CharField(max_length=2048)
+    ssh_key = models.TextField()
+    docker_image = models.CharField(max_length=1024)
+    settings = models.TextField()
+    data = models.TextField()
+
+    job_name_template = models.CharField(max_length=1024)
+    requires_template = models.TextField(null=True, blank=True)
+    script = models.TextField(null=True, blank=True)
+    
+    output_path = models.CharField(max_length=1024, null=True, blank=True)
+    custom_file = models.FileField(upload_to="/tmp/", null=True, blank=True)
+
+    def create_job(self, data):
+        job_name =self.job_name_template.format(data=data, task=self)
+        try:
+            job = Job.objects.get(name=job_name)
+        except Exception as e:
+            job = Job(name=job_name, status='watting', task=self, data=data)
+            task_signal.job_create.send(sender=self.__class__, instance=self)
+
+        return job
+        
+
+
+##
+#   export env INPUT_PATH, SSH_KEY, OUTPUT_PATH, CUSTOM_FILE, SERVER_HOST
+##
+
+class Job(models.Model):
+    name = models.CharField(max_length=1024)
+    task = models.ForeignKey(Task)
+    data = models.TextField(null=True, blank=True)
+
+    machine = models.ForeignKey(machine.models.Machine, null=True, blank=True)
+    container_id = models.CharField(max_length=1024, null=True, blank=True)
+
+
+    requires = models.ManyToManyField("self", null=True, blank=True)
+
+    status = models.CharField(max_length=1024, default="watting")
+
+    log = models.TextField(null=True, blank=True)
+
+    retry = models.IntegerField(default=0)
+
+    output = models.FileField(upload_to="/tmp/")
+
+
+    def save(self, *args, **kwargs):
+        super(Job, self).save(*args, **kwargs)
+        self.get_requires()
+
+    def get_data(self):
+        return self.data
+
+    def get_requires(self):
+        if not self.requires:
+            for task_name, value in json.loads(self.task.requires_template.format(self, data=self.get_data())).items():
+                task = Task.objects.get(name=task_name)
+                job = task.create_job(value)
+                self.requires.add(job)
+
+
+    def upload_dependence(self):
+        def upload():
+            if not exists(self.name):
+                run('mkdir {}'.format(self.name))
+
+            with cd(self.name):
+                job_path = run('pwd')
+                for job in self.requires.all():
+                    put(job.output, "/input/{}.out".format(job.name))
+
+                ssh_key_file = tempfile.NamedTemporaryFile()
+                ssh_key_file.write(self.task.ssh_key)
+                ssh_key_file.flush()
+                
+
+                put(ssh_key_file.name, "ssh_key")
+                if self.task.custom_file:
+                    put(self.task.custom_file, "customfile")
+
+            
+                if self.task.script.strip():
+                    script_file = tempfile.NamedTemporaryFile()
+                    script_file.write(self.task.script)
+                    script_file.flush()
+                    put(script_file.name, "run", mode="777")
+
+            return job_path
+        return self.machine.fab(upload)
+
+
+    def load_status(self):
+        info = self.machine.docker_client.inspect_container(self.container_id)
+        self.log = self.machine.docker_client.logs(self.container_id)
+        status = info['State']
+        if status['Running']:
+            self.status = 'running'
+        elif status['ExitCode']: 
+            self.status = 'fault'
+            task_signal.job_fault.send(sender=self.__class__, instance=self)
+        else:
+            self.status = 'success'
+            task_signal.job_success.send(sender=self.__class__, instance=self)
+        self.save()
+            
+
+    def post_success(self):
+        if not self.task.output_path:
+            return
+        client = self.machine.docker_client
+        output_file = client.copy(self.container_id, self.task.output_path)
+        client.rm(self.container_id)
+        self.output = out_file
+
+            
+    def start(self):
+        if self.status in ('watting', 'fault') and all([job.status=='success' for job in self.requires.all()]):
+            self.machine = machine.get_machine()
+
+            task_signal.job_prestart.send(sender=self.__class__, instance=self)
+
+            file_path = self.upload_dependence()
+            container_path = "/srv/info"
+
+            env = {}
+            env['INPUT_PATH'] = os.path.join(container_path, "input")
+            env['SSH_KEY'] = os.path.join(container_path, "ssh_key")
+            env['OUTPUT_PATH'] = self.task.output_path
+            env['CUSTOM_FILE'] = os.path.join(container_path, "customfile")
+            env['SCRIPT'] = os.path.join(container_path, "run")
+
+            try:
+                container_info = self.machine.docker_client.create_container(image=self.task.docker_image, command="./run", volumes="{}:{}".format(file_path, container_path), environment=env, name=self.name)
+            except Exception as e:
+                self.machine.docker_client.pull(self.task.docker_image)
+                container_info = self.machine.docker_client.create_container(image=self.task.docker_image, command="./run", volumes="{}:{}".format(file_path, container_path), environment=env, name=self.name)
+            self.container_id = container_info['Id']
+            self.machine.docker_client.start(self.container_id)
+            self.status = 'running'
+            self.save()
+
+            task_signal.job_poststart.send(sender=self.__class__, instance=self)
+
+
+    def stop(self):
+        self.machine.docker_client.rm(self.container)
+        self.status = 'fault'
+
+    def restart(self):
+        self.stop()
+        self.start()
+
+    @classmethod
+    def scan(cls):
+        watting_jobs = cls.objects.filter(status = 'watting')
+        for job in watting_jobs:
+            job.start()
+
+        running_jobs = cls.objects.filter(status == 'running')
+        for job in running_jobs:
+            job.load_status()
+        
+
+
+
+@receiver(task_signal.job_prestart, sender=Job)
+def job_prestart(*args, **kwargs):
+    print 'job_prestart'
+
+
+@receiver(task_signal.job_poststart, sender=Job)
+def job_poststart(*args, **kwargs):
+    print 'job_poststart'
+
+
+@receiver(task_signal.job_success, sender=Job)
+def job_success(*args, **kwargs):
+    print 'job_success'
