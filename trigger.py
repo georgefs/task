@@ -8,7 +8,7 @@ from task.models import *
 from machine import core
 
 
-job = Task.objects.get(pk=1).create_job(123)
+job = Task.objects.get(name="Children").create_job(value=0)
 job.start()
 
 

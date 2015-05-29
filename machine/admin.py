@@ -5,4 +5,8 @@ from .models import Machine
 
 # Register your models here.
 
-admin.site.register(Machine)
+class MachineAdmin(admin.ModelAdmin):
+    list_display = ["name", "status"]
+
+
+admin.site.register(Machine, MachineAdmin)

@@ -9,7 +9,7 @@ from gmachine import machine
 from . import models
 import random
 
-def get_machine():
+def get_machine(machine_filter, mem_limit, cpuset):
     machine_status = scan_machine()
     activity_machines = machine_status['activity_machines']
     return random.choice(activity_machines)
